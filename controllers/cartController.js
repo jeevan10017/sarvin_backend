@@ -244,53 +244,73 @@ const clearCart = async (req, res) => {
 // @desc    Sync cart (for when user logs in from different device)
 // @route   POST /api/cart/sync
 const syncCart = async (req, res) => {
-  try {
-    const { items } = req.body; // Array of {productId, quantity}
+    try {
+        const { items } = req.body; 
 
-    if (!Array.isArray(items)) {
-      return res.status(400).json({ message: 'Items must be an array' });
+        if (!Array.isArray(items) || items.length === 0) {
+            return getCart(req, res);
+        }
+
+        const user = await User.findById(req.user._id);
+        if (!user) {
+            return res.status(404).json({ message: 'User not found' });
+        }
+
+        // Fetch all product details at once for efficiency
+        const productIds = items.map(item => item.productId);
+        const products = await Product.find({ '_id': { $in: productIds } });
+        const productsMap = new Map(products.map(p => [p._id.toString(), p]));
+
+        let hasChanges = false;
+
+        for (const localItem of items) {
+            const product = productsMap.get(localItem.productId);
+            
+            if (!product) {
+                console.warn(`Sync warning: Product ID ${localItem.productId} not found. Skipping.`);
+                continue;
+            }
+
+            const existingDBItem = user.cart.items.find(
+                dbItem => dbItem.productId.toString() === localItem.productId
+            );
+
+            if (existingDBItem) {
+                let mergedQuantity = existingDBItem.quantity + localItem.quantity;
+                if (mergedQuantity > product.stock) {
+                    console.warn(`Sync warning: Merged quantity for ${product.name} exceeds stock. Capping at ${product.stock}.`);
+                    mergedQuantity = product.stock;
+                }
+                
+                if (existingDBItem.quantity !== mergedQuantity) {
+                    existingDBItem.quantity = mergedQuantity;
+                    hasChanges = true;
+                }
+
+            } else {
+                let newQuantity = localItem.quantity;
+                if (newQuantity > product.stock) {
+                    console.warn(`Sync warning: New item quantity for ${product.name} exceeds stock. Capping at ${product.stock}.`);
+                    newQuantity = product.stock;
+                }
+                
+                if (newQuantity > 0) {
+                    user.cart.items.push({ productId: localItem.productId, quantity: newQuantity });
+                    hasChanges = true;
+                }
+            }
+        }
+
+        if (hasChanges) {
+            user.cart.updatedAt = Date.now();
+            await user.save();
+        }
+        return getCart(req, res);
+
+    } catch (error) {
+        console.error('Sync cart error:', error);
+        res.status(500).json({ message: 'Server error while syncing cart', error: error.message });
     }
-
-    const user = await User.findById(req.user._id);
-    if (!user) {
-      return res.status(404).json({ message: 'User not found' });
-    }
-
-    // Validate all products exist and have sufficient stock
-    for (const item of items) {
-      if (!item.productId || !Number.isInteger(item.quantity) || item.quantity < 1) {
-        return res.status(400).json({ 
-          message: 'Invalid item format. Each item must have productId and positive integer quantity' 
-        });
-      }
-
-      const product = await Product.findById(item.productId);
-      if (!product) {
-        return res.status(400).json({ 
-          message: `Product not found: ${item.productId}` 
-        });
-      }
-      if (item.quantity > product.stock) {
-        return res.status(400).json({ 
-          message: `Insufficient stock for ${product.name}. Available: ${product.stock}`,
-          productId: item.productId,
-          availableStock: product.stock
-        });
-      }
-    }
-
-    // Clear current cart and add new items
-    await user.clearCart();
-    
-    for (const item of items) {
-      await user.addToCart(item.productId, item.quantity);
-    }
-
-    res.json({ message: 'Cart synced successfully' });
-  } catch (error) {
-    console.error('Sync cart error:', error);
-    res.status(500).json({ message: 'Server error', error: error.message });
-  }
 };
 
 module.exports = {
