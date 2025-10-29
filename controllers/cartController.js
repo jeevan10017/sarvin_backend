@@ -16,19 +16,48 @@ const getCart = async (req, res) => {
       return res.status(404).json({ message: 'User not found' });
     }
 
-    const validItems = user.cart.items.filter(item => item.productId);
+    // Filter out items with deleted products and deduplicate
+    const validItemsMap = new Map();
+    
+    user.cart.items.forEach(item => {
+      if (!item.productId) return;
+      
+      const productId = item.productId._id.toString();
+      
+      if (validItemsMap.has(productId)) {
+        // Merge duplicate
+        validItemsMap.get(productId).quantity += item.quantity;
+      } else {
+        validItemsMap.set(productId, {
+          _id: item._id,
+          productId: item.productId,
+          quantity: item.quantity,
+          addedAt: item.addedAt
+        });
+      }
+    });
 
+    const validItems = Array.from(validItemsMap.values());
+
+    // If we removed any items or deduplicated, save the cleaned cart
     if (validItems.length !== user.cart.items.length) {
-      user.cart.items = validItems;
+      user.cart.items = validItems.map(item => ({
+        productId: item.productId._id,
+        quantity: item.quantity,
+        addedAt: item.addedAt
+      }));
       await user.save();
     }
 
     let subtotal = 0;
+    let totalQuantity = 0;
+    
     const cartItems = validItems.map(item => {
       const product = item.productId;
       const price = product.discountPrice || product.price;
       const itemTotal = price * item.quantity;
       subtotal += itemTotal;
+      totalQuantity += item.quantity;
 
       return {
         _id: item._id,
@@ -52,7 +81,7 @@ const getCart = async (req, res) => {
     res.json({
       items: cartItems,
       subtotal,
-      itemCount: cartItems.length,
+      itemCount: totalQuantity, 
       updatedAt: user.cart.updatedAt
     });
   } catch (error) {
@@ -241,12 +270,11 @@ const clearCart = async (req, res) => {
   }
 };
 
-// @desc    Sync cart (for when user logs in from different device)
-// @route   POST /api/cart/sync
 const syncCart = async (req, res) => {
     try {
-        const { items } = req.body; 
+        const { items } = req.body;
 
+        // If no items to sync, just return the current cart
         if (!Array.isArray(items) || items.length === 0) {
             return getCart(req, res);
         }
@@ -256,63 +284,95 @@ const syncCart = async (req, res) => {
             return res.status(404).json({ message: 'User not found' });
         }
 
-        // Fetch all product details at once for efficiency
+        // Fetch all products in one query
         const productIds = items.map(item => item.productId);
         const products = await Product.find({ '_id': { $in: productIds } });
+        
+        if (products.length === 0) {
+            console.warn('No valid products found for sync');
+            return getCart(req, res);
+        }
+
         const productsMap = new Map(products.map(p => [p._id.toString(), p]));
 
-        let hasChanges = false;
+        // Create a map of current cart items for efficient lookup
+        const currentCartMap = new Map();
+        user.cart.items.forEach((item, index) => {
+            currentCartMap.set(item.productId.toString(), { item, index });
+        });
 
-        for (const localItem of items) {
-            const product = productsMap.get(localItem.productId);
-            
+        // Process each item from guest cart
+        for (const guestItem of items) {
+            const productIdStr = guestItem.productId.toString();
+            const product = productsMap.get(productIdStr);
+
             if (!product) {
-                console.warn(`Sync warning: Product ID ${localItem.productId} not found. Skipping.`);
+                console.warn(`Product ${productIdStr} not found. Skipping.`);
                 continue;
             }
 
-            const existingDBItem = user.cart.items.find(
-                dbItem => dbItem.productId.toString() === localItem.productId
-            );
+            const existingCartItem = currentCartMap.get(productIdStr);
 
-            if (existingDBItem) {
-                let mergedQuantity = existingDBItem.quantity + localItem.quantity;
-                if (mergedQuantity > product.stock) {
-                    console.warn(`Sync warning: Merged quantity for ${product.name} exceeds stock. Capping at ${product.stock}.`);
-                    mergedQuantity = product.stock;
-                }
+            if (existingCartItem) {
+                // Item exists - merge quantities
+                const newQuantity = Math.min(
+                    existingCartItem.item.quantity + guestItem.quantity,
+                    product.stock
+                );
                 
-                if (existingDBItem.quantity !== mergedQuantity) {
-                    existingDBItem.quantity = mergedQuantity;
-                    hasChanges = true;
-                }
-
+                user.cart.items[existingCartItem.index].quantity = newQuantity;
+                
             } else {
-                let newQuantity = localItem.quantity;
-                if (newQuantity > product.stock) {
-                    console.warn(`Sync warning: New item quantity for ${product.name} exceeds stock. Capping at ${product.stock}.`);
-                    newQuantity = product.stock;
-                }
+                // Item doesn't exist - add it
+                const quantityToAdd = Math.min(guestItem.quantity, product.stock);
                 
-                if (newQuantity > 0) {
-                    user.cart.items.push({ productId: localItem.productId, quantity: newQuantity });
-                    hasChanges = true;
+                if (quantityToAdd > 0) {
+                    user.cart.items.push({
+                        productId: guestItem.productId,
+                        quantity: quantityToAdd,
+                        addedAt: new Date()
+                    });
                 }
             }
         }
 
-        if (hasChanges) {
-            user.cart.updatedAt = Date.now();
-            await user.save();
+        // Deduplicate any remaining duplicates (safety check)
+        const deduplicatedItems = [];
+        const seenProducts = new Set();
+
+        for (const item of user.cart.items) {
+            const productIdStr = item.productId.toString();
+            
+            if (!seenProducts.has(productIdStr)) {
+                seenProducts.add(productIdStr);
+                deduplicatedItems.push(item);
+            } else {
+                // Merge duplicate
+                const existingItem = deduplicatedItems.find(
+                    i => i.productId.toString() === productIdStr
+                );
+                if (existingItem) {
+                    existingItem.quantity += item.quantity;
+                }
+            }
         }
+
+        user.cart.items = deduplicatedItems;
+        user.cart.updatedAt = Date.now();
+        
+        await user.save();
+
+        // Return the updated cart
         return getCart(req, res);
 
     } catch (error) {
         console.error('Sync cart error:', error);
-        res.status(500).json({ message: 'Server error while syncing cart', error: error.message });
+        res.status(500).json({ 
+            message: 'Failed to sync cart', 
+            error: error.message 
+        });
     }
 };
-
 module.exports = {
   getCart,
   addToCart,
